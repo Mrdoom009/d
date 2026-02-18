@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import threading
 from html import unescape
 from typing import List, Tuple, Optional
@@ -24,16 +25,13 @@ def health_check():
 threading.Thread(target=lambda: health_app.run(port=8080, host="0.0.0.0", debug=False, use_reloader=False), daemon=True).start()
 
 def clean_question(text: str) -> str:
-    """Remove 'प्रश्न X' prefix and clean."""
     text = unescape(text).strip()
     return re.sub(r'^प्रश्न\s+\d+\s*', '', text).strip()
 
 def extract_options_from_ul(ul) -> List[str]:
-    """Extract option texts from <ul> containing <li> with (अ) etc."""
     options = []
     for li in ul.find_all('li'):
         li_text = li.get_text(strip=True)
-        # Match any Devanagari character between parentheses
         match = re.match(r'^\(([\u0900-\u097F])\)\s*(.*)', li_text)
         if match:
             opt_text = match.group(2).strip()
@@ -41,24 +39,20 @@ def extract_options_from_ul(ul) -> List[str]:
     return options
 
 def extract_answer_and_explanation(div) -> Tuple[Optional[str], Optional[str]]:
-    """Extract answer and explanation from the div using regex on full text."""
     if not div:
         return None, None
     full_text = div.get_text(separator=' ', strip=True)
     answer = None
     explanation = None
-    # Extract answer after 'उत्तर :'
     answer_match = re.search(r'उत्तर\s*:\s*(.*?)(?:\s*व्याख्या\s*:|$)', full_text, re.IGNORECASE)
     if answer_match:
         answer = answer_match.group(1).strip()
-    # Extract explanation after 'व्याख्या :'
     expl_match = re.search(r'व्याख्या\s*:\s*(.*)', full_text, re.IGNORECASE)
     if expl_match:
         explanation = expl_match.group(1).strip()
     return answer, explanation
 
-def extract_questions(html: str) -> Tuple[List[str], List[str]]:
-    """Parse HTML and return (main_questions, undetected_questions) as text blocks."""
+def extract_questions_from_html(html: str) -> Tuple[List[str], List[str]]:
     soup = BeautifulSoup(html, 'html.parser')
     main_qs = []
     undetected_qs = []
@@ -76,11 +70,9 @@ def extract_questions(html: str) -> Tuple[List[str], List[str]]:
         options = extract_options_from_ul(ul)
         if not options:
             continue
-        # Find explanation button and content
         button = dd.find('button', class_='collapsible')
         explanation_div = button.find_next_sibling('div', class_='rg-c-content') if button else None
         answer_text, explanation_text = extract_answer_and_explanation(explanation_div)
-        # Determine correct option index (0-based)
         correct_idx = None
         if answer_text:
             normalized_answer = answer_text.strip()
@@ -88,10 +80,9 @@ def extract_questions(html: str) -> Tuple[List[str], List[str]]:
                 if opt == normalized_answer:
                     correct_idx = i
                     break
-        # Build output lines (no question number prefix)
         lines = [question_text]
         for i, opt in enumerate(options):
-            letter = chr(ord('a') + i)  # a, b, c, d...
+            letter = chr(ord('a') + i)
             line = f"({letter}) {opt}"
             if i == correct_idx:
                 line += " *"
@@ -105,45 +96,68 @@ def extract_questions(html: str) -> Tuple[List[str], List[str]]:
             main_qs.append(block)
     return main_qs, undetected_qs
 
-def fetch_url(url: str) -> str:
-    resp = requests.get(url, timeout=30, allow_redirects=True)
-    resp.raise_for_status()
-    return resp.text
+async def fetch_url(url: str) -> str:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: requests.get(url, timeout=30, allow_redirects=True).text)
 
 @bot.on_message(filters.command("start"))
 async def start_command(client, message: Message):
     await message.reply(
-        "📤 Send me a URL containing quiz questions in the required HTML format.\n"
-        "I'll extract them and return two text files:\n"
+        "📤 Send me one or more URLs (one per line) containing quiz questions.\n"
+        "I'll extract all questions and return two files:\n"
         "• `questions_main.txt` – questions with detected correct answers.\n"
         "• `questions_undetected.txt` – questions where correct answer could not be detected."
     )
 
 @bot.on_message(filters.text & filters.private)
-async def handle_url(client, message: Message):
-    url = message.text.strip()
-    if not url.startswith(('http://', 'https://')):
-        await message.reply("Please send a valid URL.")
+async def handle_urls(client, message: Message):
+    text = message.text.strip()
+    urls = [line.strip() for line in text.splitlines() if line.strip()]
+    if not urls:
+        await message.reply("Please send at least one URL.")
         return
-    status_msg = await message.reply("⏳ Fetching and processing...")
-    try:
-        html = fetch_url(url)
-        main_qs, undetected_qs = extract_questions(html)
-        if not main_qs and not undetected_qs:
-            await status_msg.edit_text("❌ No questions found on the page.")
-            return
-        if main_qs:
-            main_content = "\n\n".join(main_qs)
-            with open("questions_main.txt", "w", encoding="utf-8") as f:
-                f.write(main_content)
-            await message.reply_document("questions_main.txt", caption="✅ Questions with detected correct answers.")
-        if undetected_qs:
-            undetected_content = "\n\n".join(undetected_qs)
-            with open("questions_undetected.txt", "w", encoding="utf-8") as f:
-                f.write(undetected_content)
-            await message.reply_document("questions_undetected.txt", caption="⚠️ Questions where correct answer could not be detected.")
+    status_msg = await message.reply(f"⏳ Processing {len(urls)} URL(s)...")
+    all_main = []
+    all_undetected = []
+    failed = []
+    for i, url in enumerate(urls, 1):
+        if not url.startswith(('http://', 'https://')):
+            failed.append(f"{url} (invalid)")
+            continue
+        try:
+            await status_msg.edit_text(f"⏳ Fetching URL {i}/{len(urls)}: {url[:50]}...")
+            html = await fetch_url(url)
+            main_qs, undetected_qs = extract_questions_from_html(html)
+            if main_qs:
+                all_main.extend(main_qs)
+            if undetected_qs:
+                all_undetected.extend(undetected_qs)
+        except Exception as e:
+            failed.append(f"{url} ({str(e)})")
+    if not all_main and not all_undetected and not failed:
+        await status_msg.edit_text("❌ No questions found on any URL.")
+        return
+    sent_any = False
+    if all_main:
+        main_content = "\n\n".join(all_main)
+        with open("questions_main.txt", "w", encoding="utf-8") as f:
+            f.write(main_content)
+        await message.reply_document("questions_main.txt", caption=f"✅ Main questions ({len(all_main)} total)")
+        os.remove("questions_main.txt")
+        sent_any = True
+    if all_undetected:
+        undetected_content = "\n\n".join(all_undetected)
+        with open("questions_undetected.txt", "w", encoding="utf-8") as f:
+            f.write(undetected_content)
+        await message.reply_document("questions_undetected.txt", caption=f"⚠️ Undetected questions ({len(all_undetected)} total)")
+        os.remove("questions_undetected.txt")
+        sent_any = True
+    if failed:
+        fail_msg = "Failed URLs:\n" + "\n".join(failed)
+        await message.reply(fail_msg[:4096])
+    if sent_any:
         await status_msg.delete()
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
+    else:
+        await status_msg.edit_text("⚠️ No questions extracted, but some URLs failed.")
 
 bot.run()
